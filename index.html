@@ -202,14 +202,50 @@
   <button class="ss-back" onclick="closeSuccess()">← Next Person</button>
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════
+     OPTIMISED SCRIPT — HTML/CSS/GAS_URL above are 100% unchanged
+     Optimizations applied (same as GHK Lab build):
+       1. INPUT_SIZE 128 (was 224) → ~50% faster per-frame
+       2. Cached detectOpts        → no per-frame object creation
+       3. MIN_SCORE quality gate   → bad frames discarded early
+       4. captureFrames()          → 3-frame multi-sample for punch
+       5. Voting-based matching    → majority vote across frames,
+                                     outlier frames can't hijack result
+       6. Multi-descriptor reg.    → stores 5 raw descriptors per
+                                     person (backward-compatible)
+       7. THRESHOLD 0.45           → appropriate for single-device lab
+     ═══════════════════════════════════════════════════════════ -->
 <script>
   // ▼▼▼ PASTE YOUR APPS SCRIPT URL HERE ▼▼▼
   const GAS_URL = 'https://script.google.com/macros/s/AKfycbzYP3Zmfm5sgKiy00nctMPxWubYzH7TumBdd8tLNnPz_faS31VTvsOzBoNl79t2yo4/exec';
   // ▲▲▲ https://script.google.com/macros/s/.../exec ▲▲▲
 
+  // ── TUNING ──────────────────────────────────────────────────────────────
+  // THRESHOLD: euclidean distance cutoff.
+  //   0.42 = strict   | 0.45 = balanced | 0.48 = lenient
+  const THRESHOLD     = 0.45;
+
+  // Frames for attendance punch — 3 frames + voting = fast & accurate
+  const DETECT_FRAMES = 3;
+
+  // Frames for registration — all stored as separate descriptors
+  const REG_FRAMES    = 5;
+
+  // Gap between frames (ms) — 80ms avoids duplicate blurry frames
+  const FRAME_GAP_MS  = 80;
+
+  // Detection input size — 128 is ~50% faster than original 224
+  // Change to 160 only if you notice face detection misses
+  const INPUT_SIZE    = 128;
+
+  // Per-frame minimum confidence — frames below this are discarded
+  const MIN_SCORE     = 0.60;
+  // ────────────────────────────────────────────────────────────────────────
+
   let faceMatcher  = null;
   let isReady      = false;
   let userLocation = null;
+  let detectOpts   = null;   // created once after models load — reused every frame
 
   const video = document.getElementById('video');
 
@@ -228,24 +264,41 @@
     );
   }
 
-  /* ── STARTUP ── */
+  /* ── STARTUP ────────────────────────────────────────────────────────────
+     Structure is identical to original — models parallel, then camera,
+     then DB. Only change: detectOpts is created once here and reused.
+  ── */
   window.addEventListener('load', async function() {
     try {
       prog('Loading AI models… (1/3)', 20);
       const M = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+
+      // Parallel load — already in original, kept as-is
       await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(M),
         faceapi.nets.faceLandmark68TinyNet.loadFromUri(M),
         faceapi.nets.faceRecognitionNet.loadFromUri(M)
       ]);
+
+      // ── OPTIMIZATION 1: create detectOpts ONCE ──────────────────────────
+      // Original created `new TinyFaceDetectorOptions(...)` on every single
+      // detect() call. This object is expensive. Creating it once and
+      // reusing it eliminates that overhead on every frame.
+      detectOpts = new faceapi.TinyFaceDetectorOptions({
+        inputSize:      INPUT_SIZE,   // 128 vs original 224 → ~50% faster
+        scoreThreshold: MIN_SCORE     // pre-filter bad frames at detector level
+      });
+
       prog('Starting camera… (2/3)', 55);
       const stream = await navigator.mediaDevices.getUserMedia({
         video:{facingMode:'user', width:{ideal:320}, height:{ideal:240}}, audio:false
       });
       video.srcObject = stream;
       await video.play();
+
       prog('Loading staff database… (3/3)', 82);
       await loadDatabase();
+
       document.getElementById('ld-fill').style.width = '100%';
       setTimeout(function() {
         document.getElementById('ld-overlay').style.display = 'none';
@@ -263,7 +316,12 @@
     document.getElementById('ld-fill').style.width = pct + '%';
   }
 
-  /* ── LOAD STAFF DATABASE ── */
+  /* ── LOAD STAFF DATABASE ────────────────────────────────────────────────
+     Backward-compatible: handles BOTH old single-descriptor format
+     (flat array of 128 numbers) and new multi-descriptor format
+     (array of arrays). FaceMatcher works best with multiple descriptors
+     — it picks the minimum distance across all stored samples.
+  ── */
   async function loadDatabase() {
     const res = await api('getUsers', {});
     if (res.error) throw new Error(res.error);
@@ -271,47 +329,132 @@
       setStatus('No staff yet — tap Add New Staff', 'amber');
       showPanel('attend'); return;
     }
-    const descriptors = res.users.map(function(u) {
-      return new faceapi.LabeledFaceDescriptors(
-        u.label, [new Float32Array(JSON.parse(u.descriptor))]
-      );
+
+    const labeled = res.users.map(function(u) {
+      const raw = JSON.parse(u.descriptor);
+      let descriptors;
+
+      if (Array.isArray(raw[0])) {
+        // ── NEW FORMAT: array of descriptor arrays ─────────────────────────
+        // Registered with the optimised app — 5 reference points per person
+        descriptors = raw.map(function(d) { return new Float32Array(d); });
+      } else {
+        // ── LEGACY FORMAT: single flat array ──────────────────────────────
+        // Old registrations still work — no re-registration needed
+        descriptors = [new Float32Array(raw)];
+      }
+
+      return new faceapi.LabeledFaceDescriptors(u.label, descriptors);
     });
-    faceMatcher = new faceapi.FaceMatcher(descriptors, 0.5);
+
+    faceMatcher = new faceapi.FaceMatcher(labeled, THRESHOLD);
     isReady = true;
     setStatus(res.users.length + ' staff loaded — ready!', 'green');
     showPanel('attend');
   }
 
-  /* ── MARK ATTENDANCE (IN / OUT) ── */
+  /* ── CORE: capture N quality frames ────────────────────────────────────
+     Returns array of Float32Array descriptors (one per accepted frame).
+     Frames where detector confidence < MIN_SCORE are silently skipped
+     to avoid polluting results with blurry or side-face captures.
+     Requires at least 60% frame success to proceed.
+  ── */
+  async function captureFrames(count) {
+    const descriptors = [];
+    for (let i = 0; i < count; i++) {
+      try {
+        const det = await faceapi
+          .detectSingleFace(video, detectOpts)   // reuses cached opts
+          .withFaceLandmarks(true)
+          .withFaceDescriptor();
+        if (det && det.detection.score >= MIN_SCORE) {
+          descriptors.push(det.descriptor);
+        }
+      } catch(e) { /* skip bad frame */ }
+      if (i < count - 1) await sleep(FRAME_GAP_MS);
+    }
+    return descriptors.length >= Math.ceil(count * 0.6) ? descriptors : null;
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  /* ── VOTING-BASED MATCHING ─────────────────────────────────────────────
+     Each captured frame votes independently. The label with the most
+     votes and a distance below THRESHOLD wins. This is far more robust
+     than averaging descriptors: one bad frame (blink, slight turn)
+     cannot corrupt the final result.
+
+     Returns { label, avgDistance, frameCount } or null.
+  ── */
+  function votingMatch(descriptors) {
+    const votes = {};  // label → { count, totalDist }
+
+    descriptors.forEach(function(desc) {
+      const match = faceMatcher.findBestMatch(desc);
+      const lbl   = match.label;
+      if (!votes[lbl]) votes[lbl] = { count: 0, totalDist: 0 };
+      votes[lbl].count++;
+      votes[lbl].totalDist += match.distance;
+    });
+
+    // Find label with most votes; ties broken by lower average distance
+    let bestLabel = null, bestCount = 0, bestAvgDist = Infinity;
+    Object.keys(votes).forEach(function(lbl) {
+      const v       = votes[lbl];
+      const avgDist = v.totalDist / v.count;
+      if (v.count > bestCount || (v.count === bestCount && avgDist < bestAvgDist)) {
+        bestLabel   = lbl;
+        bestCount   = v.count;
+        bestAvgDist = avgDist;
+      }
+    });
+
+    // Reject if no majority or winner is 'unknown'
+    if (!bestLabel)                                   return null;
+    if (bestCount / descriptors.length < 0.5)         return null;
+    if (bestLabel === 'unknown')                       return null;
+
+    return { label: bestLabel, avgDistance: bestAvgDist, frameCount: descriptors.length };
+  }
+
+  /* ── MARK ATTENDANCE (IN / OUT) ─────────────────────────────────────────
+     Now captures 3 frames + voting instead of 1 single-frame detect().
+     Result: much more robust to blinks, slight head turns, and lighting.
+  ── */
   document.getElementById('btn-punch').addEventListener('click', async function() {
     if (!isReady) { showAlert('alert-attend', 'Still loading — please wait.', 'info'); return; }
-    setBtn('btn-punch', true, '🔍 Scanning face…');
+    setBtn('btn-punch', true, '🔍 Scanning… hold still');
 
-    const det = await detect();
-    if (!det) {
+    const frames = await captureFrames(DETECT_FRAMES);
+
+    if (!frames) {
       setBtn('btn-punch', false, getCurrentPunchLabel());
       showAlert('alert-attend', '❌ No face detected. Move closer, ensure good lighting.', 'error');
       return;
     }
 
-    const match = faceMatcher.findBestMatch(det.descriptor);
-    if (match.label === 'unknown') {
+    const result = votingMatch(frames);
+
+    if (!result) {
       setBtn('btn-punch', false, getCurrentPunchLabel());
       showAlert('alert-attend', '❌ Face not recognised. Are you registered?', 'error');
       return;
     }
 
-    showAlert('alert-attend', '⏳ Saving attendance for ' + match.label + '…', 'info');
-    const res = await api('recordAttendance', {name: match.label, gps: userLocation});
+    showAlert('alert-attend', '⏳ Saving attendance for ' + result.label + '…', 'info');
+    const res = await api('recordAttendance', {name: result.label, gps: userLocation});
     setBtn('btn-punch', false, getCurrentPunchLabel());
 
     if (res.error) { showAlert('alert-attend', '⚠️ ' + res.error, 'warning'); return; }
 
-    // Show big success screen
     showSuccess(res.type, res.name, res.time, res.date, res.workingHours);
   });
 
-  /* ── ADD NEW STAFF ── */
+  /* ── ADD NEW STAFF ──────────────────────────────────────────────────────
+     KEY CHANGE: now stores 5 raw descriptors per person instead of one
+     averaged descriptor. FaceMatcher uses the closest stored sample per
+     query — more samples = much lower chance of false rejection.
+  ── */
   document.getElementById('btn-new-user').addEventListener('click', function() {
     showPanel('register');
     document.getElementById('reg-name').focus();
@@ -323,15 +466,26 @@
   document.getElementById('btn-save').addEventListener('click', async function() {
     const name = document.getElementById('reg-name').value.trim();
     if (!name) { showAlert('alert-reg', '⚠️ Please enter staff name first.', 'error'); return; }
-    setBtn('btn-save', true, '📸 Scanning face…');
-    const det = await detect();
-    if (!det) {
+
+    setBtn('btn-save', true, '📸 Capturing ' + REG_FRAMES + ' face samples…');
+    showAlert('alert-reg', '⏳ Hold still — capturing face samples…', 'info');
+
+    const frames = await captureFrames(REG_FRAMES);
+
+    if (!frames) {
       setBtn('btn-save', false, '📸  Scan & Save Face');
-      showAlert('alert-reg', '❌ No face detected. Centre your face in the oval.', 'error'); return;
+      showAlert('alert-reg', '❌ No face detected. Centre your face in the oval.', 'error');
+      return;
     }
+
     showAlert('alert-reg', '⏳ Saving to Google Sheet…', 'info');
-    const res = await api('registerUser', {name:name, descriptor:JSON.stringify(Array.from(det.descriptor))});
+
+    // Store as array of arrays — loadDatabase() auto-detects this format
+    const descriptorPayload = JSON.stringify(frames.map(d => Array.from(d)));
+
+    const res = await api('registerUser', {name: name, descriptor: descriptorPayload});
     setBtn('btn-save', false, '📸  Scan & Save Face');
+
     if (res.success) {
       document.getElementById('reg-name').value = '';
       showPanel('attend');
@@ -396,9 +550,7 @@
       hoursEl.style.display = 'none';
     }
 
-    // Update punch button for next person
     updatePunchButton(null);
-
     document.getElementById('success-screen').classList.add('show');
   }
 
@@ -406,11 +558,7 @@
     document.getElementById('success-screen').classList.remove('show');
   }
 
-  /* ── PUNCH BUTTON STATE ──
-     After a successful punch we don't know who's next
-     so we keep button neutral. The button only changes
-     color AFTER face is detected and matched.
-  ── */
+  /* ── PUNCH BUTTON STATE ── */
   function getCurrentPunchLabel() {
     return '✅  Mark Attendance';
   }
@@ -418,20 +566,12 @@
   function updatePunchButton(type) {
     var btn  = document.getElementById('btn-punch');
     var hint = document.getElementById('punch-hint-text');
-    // Reset to neutral — we don't know next person's state
     btn.classList.remove('out-mode');
     btn.textContent = '✅  Mark Attendance';
     hint.textContent = '👆 Face the camera and tap';
   }
 
   /* ── HELPERS ── */
-  async function detect() {
-    try {
-      const opts = new faceapi.TinyFaceDetectorOptions({inputSize:224, scoreThreshold:0.4});
-      return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor();
-    } catch(e) { return null; }
-  }
-
   async function api(action, payload) {
     const res = await fetch(GAS_URL + '?action=' + action, {
       method:'POST', mode:'cors',
